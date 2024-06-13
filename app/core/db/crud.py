@@ -1,10 +1,11 @@
 import random
 from typing import Any
 
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 from app.core.db import models, schemas
-from app.core.db.models import Scripts, Question, Shortform, Admin, History, Ranking, CaseScripts, Comment, Category
+from app.core.db.models import Scripts, Question, Shortform, Admin, History, Ranking, CaseScripts, Comment, Category, \
+    User
 from passlib.hash import bcrypt
 
 from app.core.db.schemas import CategoryCreate, CategoryUpdate
@@ -384,8 +385,9 @@ def get_latest_shortform(db):
 
 
 # admin
-def get_admin_by_admin_name(db: Session, admin_name: str):
-    return db.query(Admin).filter(Admin.admin_name == admin_name).first()
+def get_admin_by_admin_name(db: Session, admin_name: str) -> object:
+    db_admin=db.query(Admin).filter(Admin.admin_name == admin_name).first()
+    return db_admin.qualification_level
 
 
 def get_active_admin_by_admin_name(db: Session, admin_name: str):
@@ -495,3 +497,50 @@ def update_ranking_points(db: Session, user_id: int, new_points):
         db.commit()
         return ranking
     return None
+
+
+# 생성된 문제 개수
+def get_created_problem_count(db: Session):
+    count = db.query(func.count(Scripts.scripts_id)).scalar()
+    return count
+
+
+# 검토 완료된 문제 개수
+def get_true_questions_count(db: Session):
+    count = db.query(func.count(Scripts.scripts_id)).filter(Scripts.inspection_status == True).scalar()
+    return count
+
+
+# 사용자 수
+def get_user_count(db: Session):
+    count = db.query(func.count(User.user_id)).scalar()
+    return count
+
+
+def update_inspection_status(db: Session, scripts_id: int):
+    script = db.query(Scripts).filter(Scripts.scripts_id == scripts_id).first()
+    if script:
+        script.inspection_status = True
+        db.commit()
+
+    return script.inspection_status
+
+
+def get_scripts(db: Session):
+    return db.query(Scripts).all()
+
+
+def get_questions(db: Session):
+    return db.query(Question).all()
+
+
+def get_comments(db: Session):
+    return db.query(Comment).all()
+
+
+def get_case_scripts(db: Session):
+    return db.query(CaseScripts).all()
+
+
+def get_shortform(db: Session):
+    return db.query(Shortform).all()
