@@ -509,20 +509,21 @@ def update_ranking_points(db: Session, user_id: int, new_points):
 
 def get_ranking(db: Session):
     ranking = (
-        db.query(Ranking, User.nickname
+        db.query(Ranking.ranking_position, Ranking.user_id, User.nickname, Ranking.user_point)
         .join(User, Ranking.user_id == User.user_id)
         .filter(Ranking.ranking_position <= 3)
         .order_by(Ranking.ranking_position)
         .all()
     )
 
-    # ranking은 이제 (Ranking 객체, User.nickname) 형태의 튜플 리스트입니다.
+    # ranking은 이제 (ranking_position, user_id, nickname, points) 형태의 튜플 리스트입니다.
     result = []
-    for rank, nickname in ranking:
+    for ranking_position, user_id, nickname, user_point in ranking:
         result.append({
-            'ranking_position': rank.ranking_position,
-            'user_id': rank.user_id,
-            'nickname': nickname
+            'ranking_position': ranking_position,
+            'user_id': user_id,
+            'nickname': nickname,
+            'points': user_point
         })
     return result
 
@@ -556,6 +557,41 @@ def update_inspection_status(db: Session, scripts_id: int):
 
 def get_scripts(db: Session):
     return db.query(Scripts).all()
+
+
+def get_random_script_by_category_label_and_level(db: Session, category_label: int, level: int):
+    # 1. Find all categories with the given label
+    categories = db.query(Category).filter(Category.label == category_label).all()
+
+    if not categories:
+        return None  # No categories found with the given label
+
+    # 2. Randomly select one of these categories
+    selected_category = random.choice(categories)
+
+    # 3. Find all scripts with the selected category_id, level, and inspection_status True
+    scripts = db.query(Scripts).filter(
+        Scripts.category_id == selected_category.category_id,
+        Scripts.level == level,
+        Scripts.inspection_status == True
+    ).all()
+
+    if not scripts:
+        return None  # No scripts found with the given category_id, level, and inspection_status True
+
+    # 4. Randomly select and return one of these scripts
+    return random.choice(scripts)
+
+
+def get_shortforms_by_scripts_id(db: Session, scripts_id: int):
+    return db.query(Shortform).filter(Shortform.scripts_id == scripts_id).all()
+
+
+def get_questions_by_scripts_id(db: Session, scripts_id: int):
+    return db.query(Question).filter(Question.scripts_id == scripts_id).all()
+
+def get_comments_by_q_id(db: Session, q_id: int):
+    return db.query(Comment).filter(Comment.q_id == q_id).all()
 
 
 def get_questions(db: Session):
