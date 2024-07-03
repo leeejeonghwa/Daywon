@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 
 class CreateContentRequest(BaseModel):
@@ -14,7 +14,12 @@ class UserBase(BaseModel):
     level: str = "1"
     user_point: int = 0
     profile_image: int
-    user_id: int
+
+
+class PasswordChangeRequest(BaseModel):
+    e_mail: str
+    name: str
+    new_password: str
 
 
 class UserCreate(UserBase):
@@ -23,7 +28,7 @@ class UserCreate(UserBase):
 
 class UserRead(UserBase):
     is_active: bool
-
+    user_id: int
 
 
 class PointsUpdate(BaseModel):
@@ -251,3 +256,25 @@ class HistoryRead(HistoryBase):
 
 class HistoryUpdate(BaseModel):
     T_F: Optional[bool] = None
+
+
+class Quiz(BaseModel):
+    enrollment_quiz_id: int
+    question: str
+    option_1: str
+    option_2: str
+    option_3: str
+    option_4: str
+    correct: int
+
+    class Config:
+        orm_mode = True
+
+
+class UserAnswer(BaseModel):
+    enrollment_quiz_id: int
+    answer: int
+
+
+class UserAnswers(BaseModel):
+    answers: List[UserAnswer]

@@ -1,49 +1,42 @@
 import io
-import uvicorn
-from fastapi import HTTPException, Form, Depends
+import json
 import os
+import re
+import asyncio
+import ftplib
 
-from pydantic import BaseModel
+import uvicorn
+from fastapi import HTTPException, Form, Depends, FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.security import APIKeyCookie
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-import re
 
-from starlette.middleware.cors import CORSMiddleware
-
-from app.core.problem.chatbot import router as chat_router
-from starlette.responses import RedirectResponse, JSONResponse
-
-from app.core.FTP_SERVER.ftp_util import read_binary_file_from_ftp, list_files
-from app.core.db import models, schemas, crud
-from app.core.db.base import SessionLocal, engine
-from app.core.db.crud import get_user_by_email, update_user, update_user_points, get_user, update_script, \
-    update_case_script, update_question, update_comment, get_category_by_content, get_admin_by_admin_name, \
-    get_user_by_email_and_name, get_user_by_nickname_and_name
-from app.core.db.models import Admin
-from app.core.db.schemas import UserCreate, UserBase, Login, UserUpdate, PointsUpdate, ModifyScriptRequest, AdminCreate, \
-    AdminUpdate, AdminLogin, CreateContentRequest, ScriptsRead
+from contextlib import asynccontextmanager
 from passlib.context import CryptContext
+from pydantic import BaseModel
 from typing import List, Optional
 
-from app.core.problem.createProblem import create_problem, combine_problem_parts, merge_explanations, \
-    modify_problem_comment
+from starlette.staticfiles import StaticFiles
+from starlette.templating import Jinja2Templates
+
+from app.core.FTP_SERVER import setting
+from app.core.db.crud import get_category_by_content, get_profile_image_url, update_question, update_comment, \
+    get_user_for_password, get_user, get_user_by_email_and_name, get_user_by_nickname_and_name, get_user_by_email, \
+    update_user, update_user_points
+from app.core.db.schemas import ScriptsRead, CreateContentRequest, ModifyScriptRequest, PasswordChangeRequest, \
+    UserCreate, Login, UserUpdate, PointsUpdate
+from app.core.problem.chatbot import router as chat_router
+from app.core.FTP_SERVER.ftp_util import read_binary_file_from_ftp, list_files, download_file_from_ftp, video_from_ftp
+from app.core.db import models, schemas, crud
+from app.core.db.base import SessionLocal, engine
+from app.core.video.createVideo import VideoCreator, ftp_directory
 from app.core.prompt_image.createImage import generate_images
 from app.core.prompt_image.createPrompt import create_prompt, create_case_prompt, modify_prompt, modify_case_prompt
-from app.core.video.createVideo import VideoCreator, ftp_directory
-from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-# from starlette.templating import Jinja2Templates
-from fastapi.templating import Jinja2Templates
-from sqlalchemy.orm import Session
-from passlib.context import CryptContext
-from fastapi.security import APIKeyCookie
-from starlette.middleware.sessions import SessionMiddleware
-from fastapi.responses import StreamingResponse
-from fastapi import FastAPI, Response
-from fastapi.responses import StreamingResponse
-from ftplib import FTP, error_perm, error_temp, all_errors
-from app.core.problem.chatbot import *
+from app.core.problem.createProblem import create_problem, combine_problem_parts, merge_explanations, \
+    modify_problem_comment
 
 # DB 테이블 생성
 models.Base.metadata.create_all(bind=engine)
@@ -69,7 +62,7 @@ app.add_middleware(
 
 
 # Dependency(DB 접근 함수)
-def get_db():
+async def get_db():
     db = SessionLocal()
     try:
         yield db
@@ -82,6 +75,38 @@ class Message(BaseModel):
 
 
 app.include_router(chat_router, prefix="/api")
+
+
+# 전역 예외 핸들러
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "detail": exc.detail},
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    # 여기에 로그를 남기거나 추가 처리를 할 수 있습니다.
+    return JSONResponse(
+        status_code=500,
+        content={"status": "error", "detail": "An unexpected error occurred"},
+    )
+
+
+@app.put("/change-password/")
+def change_password(request: PasswordChangeRequest, db: Session = Depends(get_db)):
+    user = get_user_for_password(db, request.e_mail, request.name)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    hashed_password = pwd_context.hash(request.new_password)
+    user.hashed_password = hashed_password
+    db.commit()
+    db.refresh(user)
+
+    return {"msg": "Password updated successfully"}
 
 
 # 세션에서 현재 사용자를 가져오는 함수 정의
@@ -125,20 +150,36 @@ async def read_content_list_root(request: Request):
     return templates.TemplateResponse("content_list.html", {"request": request})
 
 
-@app.get("/read_admins_list/", response_model=List[schemas.Admin])
-async def read_admins(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    admins = crud.get_admins(db, skip=skip, limit=limit)
+@app.get("/read_admins_list_mobile/", response_model=List[schemas.Admin])
+async def read_admins_mobile(db: Session = Depends(get_db)):
+    admins = crud.get_admins_mobile(db)
     return admins
+
+
+@app.get("/read_admins_list/", response_model=List[schemas.Admin])
+async def read_admins(skip: int = 0, limit: int = 10, level: int = None, db: Session = Depends(get_db)):
+    query = db.query(models.Admin).filter(models.Admin.qualification_level != 3)
+    if level is not None:
+        query = query.filter(models.Admin.qualification_level == level)
+    admins = query.offset(skip).limit(limit).all()
+    return admins
+
+
+@app.get("/admins_count/", response_model=int)
+async def read_admin_count(level: int = None, db: Session = Depends(get_db)):
+    query = db.query(models.Admin).filter(models.Admin.qualification_level != 3)
+    if level is not None:
+        query = query.filter(models.Admin.qualification_level == level)
+    count = query.count()
+    return count
 
 
 @app.post("/create_admin/")
 async def create_admin(admin: schemas.AdminCreate, db: Session = Depends(get_db)):
-    try:
-        crud.create_admin(db, admin)
-        return "success"
-    except Exception as e:
-        # 예외가 발생하면 에러 메시지를 반환
-        return "error"
+    created_admin = crud.create_admin(db, admin)
+    if not created_admin:
+        raise HTTPException(status_code=404, detail="Admin not create")
+    return "success"
 
 
 @app.put("/update_admins/{admin_id}")
@@ -179,7 +220,7 @@ async def create_user(user: UserCreate, db: Session = Depends(get_db)):
     return crud.create_user(db=db, user_create=user)
 
 
-@app.get("/users/{user_id}/readuser", response_model=schemas.UserBase)
+@app.get("/users/{user_id}/read_user", response_model=schemas.UserRead)
 async def read_user(user_id: int, db: Session = Depends(get_db)):
     user = get_user(db, user_id)
     return user
@@ -193,7 +234,7 @@ async def check_email(email: str, db: Session = Depends(get_db)):
 
 
 @app.post("/user_find-password")
-def find_password(email: str, name: str, db: Session = Depends(get_db)):
+async def find_password(email: str, name: str, db: Session = Depends(get_db)):
     user = get_user_by_email_and_name(db, email, name)
     if user:
         return {"password": user.hashed_password}
@@ -201,7 +242,7 @@ def find_password(email: str, name: str, db: Session = Depends(get_db)):
 
 
 @app.post("/user_find-email")
-def find_email(nickname: str, name: str, db: Session = Depends(get_db)):
+async def find_email(nickname: str, name: str, db: Session = Depends(get_db)):
     user = get_user_by_nickname_and_name(db, nickname, name)
     if user:
         return {"email": user.e_mail}
@@ -216,7 +257,7 @@ async def check_nickname(nickname: str, db: Session = Depends(get_db)):
 
 
 # 사용자 정보를 검색하는 엔드포인트
-@app.get("/users/{e_mail}", response_model=schemas.UserBase)
+@app.get("/users/{e_mail}", response_model=schemas.UserRead)
 async def read_user_by_email(email: str, db: Session = Depends(get_db)):
     db_user = crud.get_user_by_email(db, e_mail=email)
     if not db_user:
@@ -224,7 +265,7 @@ async def read_user_by_email(email: str, db: Session = Depends(get_db)):
     return db_user
 
 
-@app.post("/login/", response_model=UserBase)
+@app.post("/login/", response_model=schemas.UserRead)
 async def login(credentials: Login, db: Session = Depends(get_db)):
     user = get_user_by_email(db, e_mail=credentials.e_mail)
     # 비밀번호 확인
@@ -289,6 +330,14 @@ async def update_user_history(user_id: int, scripts_id: int, T_F: bool, db: Sess
     return {"success"}
 
 
+@app.get("/users/{user_id}/profile-image")
+async def get_profile_image(user_id: int, db: Session = Depends(get_db)):
+    profile_image_url = get_profile_image_url(user_id, db)
+    if profile_image_url is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"profile_image_url": profile_image_url}
+
+
 @app.get("/get_user_history/{user_id}")
 async def get_user__history(user_id: int, T_F: bool, db: Session = Depends(get_db)):
     user_history = crud.get_user_history(db, user_id=user_id, T_F=T_F)
@@ -299,10 +348,8 @@ async def get_user__history(user_id: int, T_F: bool, db: Session = Depends(get_d
 
 @app.post("/category/", response_model=schemas.Category)
 async def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_db)):
-    return crud.create_category(db, category)
+    return crud.create_categories(db, category)
 
-
-#################################################
 
 @app.get("/read_content_list_status/", response_model=List[ScriptsRead])
 async def read_scripts(inspection_status: bool, db: Session = Depends(get_db)):
@@ -337,14 +384,6 @@ async def read_scripts(inspection_status: bool, db: Session = Depends(get_db)):
 
     print(f"Result: {result}")
     return result
-
-
-@app.get("/scripts_read/{scripts_id}")
-async def read_script(scripts_id: int, db: Session = Depends(get_db)):
-    db_script = crud.get_script(db, scripts_id=scripts_id)
-    if db_script is None:
-        raise HTTPException(status_code=404, detail="Script not found")
-    return db_script
 
 
 @app.get("/scripts_read/{scripts_id}")
@@ -674,7 +713,8 @@ async def admin_login(request: Request, admin_name: str = Form(...), password: s
                       db: Session = Depends(get_db)):
     admin = crud.get_active_admin_by_admin_name(db, admin_name)
     if not admin or admin.password != password:
-        return {"fail"}
+        # 로그인 실패 시 JSON 응답으로 오류 메시지 반환
+        return JSONResponse(content={"error": "로그인에 실패하였습니다"}, status_code=400)
 
     session = request.session
     session["user"] = {
@@ -684,22 +724,6 @@ async def admin_login(request: Request, admin_name: str = Form(...), password: s
     }
     response = RedirectResponse(url="/admin_mainpage", status_code=303)
     return response
-
-
-@app.post("/admins/login_mobile")
-async def admin_login(request: Request, admin_name: str = Form(...), password: str = Form(...),
-                      db: Session = Depends(get_db)):
-    admin = crud.get_active_admin_by_admin_name(db, admin_name)
-    if not admin or admin.password != password:
-        return {"status": "fail"}
-
-    session = request.session
-    session["user"] = {
-        "admin_id": admin.admin_id,
-        "admin_name": admin.admin_name,
-        "qualification_level": admin.qualification_level
-    }
-    return {"status": "success"}  # 성공 시 명확한 메시지 반환
 
 
 @app.post("/admins/login_mobile")
@@ -730,18 +754,13 @@ async def content_view(request: Request, content_id: int, db: Session = Depends(
     comment_data = crud.get_comment_by_script_id(db, content_id)
 
     video_url = None
-    remote_file_path = ""
-
-    if shortform_data.form_url:
-        remote_video_url = shortform_data.form_url
-        remote_file_path = f"/video/{remote_video_url}"
-
-    else:
-        remote_video_url = "completed_video_1.mp4"
-        video_response = None
+    file_contents = ""
 
     try:
-        file_contents = read_binary_file_from_ftp(remote_file_path)
+        if shortform_data.form_url:
+            remote_video_url = shortform_data.form_url
+            remote_file_path = f"/video/{remote_video_url}"
+            file_contents = await read_binary_file_from_ftp(remote_file_path)
 
         if file_contents:
             video_response = StreamingResponse(io.BytesIO(file_contents), media_type="video/mp4")
@@ -750,8 +769,8 @@ async def content_view(request: Request, content_id: int, db: Session = Depends(
             # raise HTTPException(status_code=500, detail="Failed to retrieve video")
             video_url = None
     except Exception as e:
-        # raise HTTPException(status_code=500, detail="Error retrieving video from FTP server")
-        video_url = None
+        print("error:", e)
+        video_url = "FTP error"
 
     return templates.TemplateResponse("content_inspection_page.html", {
         "request": request,
@@ -764,6 +783,7 @@ async def content_view(request: Request, content_id: int, db: Session = Depends(
     })
 
 
+# FastAPI endpoint for streaming video
 @app.get("/get_stream_video/{scripts_id}")
 async def get_stream_video(request: Request, scripts_id: int, db: Session = Depends(get_db)):
     script_data = crud.get_script(db, scripts_id)
@@ -771,41 +791,24 @@ async def get_stream_video(request: Request, scripts_id: int, db: Session = Depe
         raise HTTPException(status_code=404, detail="Script not found")
 
     shortform_data = crud.get_shortform_by_scripts_id(db, scripts_id)
-
-    video_url = None
     remote_file_path = ""
 
     if shortform_data.form_url:
         remote_video_url = shortform_data.form_url
         remote_file_path = f"/video/{remote_video_url}"
-
     else:
         remote_video_url = "completed_video_1.mp4"
-        video_response = None
+        remote_file_path = None
 
-    try:
-        file_contents = read_binary_file_from_ftp(remote_file_path)
-
-        if file_contents:
-            video_response = StreamingResponse(io.BytesIO(file_contents), media_type="video/mp4")
-            video_url = request.url_for("stream_video", video_path=remote_video_url)
-        else:
-            # raise HTTPException(status_code=500, detail="Failed to retrieve video")
-            video_url = None
-    except Exception as e:
-        # raise HTTPException(status_code=500, detail="Error retrieving video from FTP server")
-        video_url = None
-
-    return {
-        "request": request,
-        "scripts_id": scripts_id,
-        "shortform_data": shortform_data,
-        "video_url": video_url  # 템플릿에 비디오 스트리밍 응답을 전달합니다.
-    }
+    video_stream = video_from_ftp(remote_file_path)
+    if video_stream:
+        return StreamingResponse(video_stream, media_type='video/mp4')
+    else:
+        raise HTTPException(status_code=404, detail="Video not found")
 
 
 @app.get("/read/scripts/random/")
-def read_random_script(category_label: int, level: int, db: Session = Depends(get_db)):
+async def read_random_script(category_label: int, level: int, db: Session = Depends(get_db)):
     script = crud.get_random_script_by_category_label_and_level(db, category_label, level)
     if script is None:
         raise HTTPException(status_code=404, detail="Script not found")
@@ -824,38 +827,71 @@ def read_random_script(category_label: int, level: int, db: Session = Depends(ge
         headers={"Content-Type": "application/json; charset=utf-8"}
     )
 
+
 @app.get("/scripts/{scripts_id}/shortforms")
-def read_shortforms(scripts_id: int, db: Session = Depends(get_db)):
+async def read_shortforms(scripts_id: int, db: Session = Depends(get_db)):
     shortform_url = crud.get_shortforms_by_scripts_id(db, scripts_id)
     if not shortform_url:
         raise HTTPException(status_code=404, detail="Shortforms not found")
     return shortform_url
 
+
 @app.get("/scripts/{scripts_id}/questions")
-def read_questions(scripts_id: int, db: Session = Depends(get_db)):
+async def read_questions(scripts_id: int, db: Session = Depends(get_db)):
     questions = crud.get_questions_by_scripts_id(db, scripts_id)
     if not questions:
         raise HTTPException(status_code=404, detail="Questions not found")
-    return questions
+
+    # JSON 응답을 UTF-8로 인코딩하여 반환
+    response_content = json.dumps(questions, ensure_ascii=False).encode('utf-8')
+    return JSONResponse(content=response_content, media_type='application/json')
+
 
 @app.get("/questions/{q_id}/comments")
-def read_comments(q_id: int, db: Session = Depends(get_db)):
+async def read_comments(q_id: int, db: Session = Depends(get_db)):
     comments = crud.get_comments_by_q_id(db, q_id)
     if not comments:
         raise HTTPException(status_code=404, detail="Comments not found")
-    return comments
+
+    combined_comment = " ".join(
+        f"{comment.comment_1} {comment.comment_2} {comment.comment_3} {comment.comment_4}".strip()
+        for comment in comments
+    )
+
+    return JSONResponse(
+        content={
+            "combined_comment": combined_comment
+        },
+        media_type="application/json",
+        headers={"Content-Type": "application/json; charset=utf-8"}
+    )
+
 
 @app.get("/stream_video/{video_path}")
 async def stream_video(request: Request, video_path: str):
     remote_file_path = f"/video/{video_path}"
     try:
-        file_contents = read_binary_file_from_ftp(remote_file_path)
+        file_contents = await read_binary_file_from_ftp(remote_file_path)
         if file_contents:
             return StreamingResponse(io.BytesIO(file_contents), media_type="video/mp4")
         else:
             raise HTTPException(status_code=500, detail="Failed to retrieve video")
     except Exception as e:
         raise HTTPException(status_code=500, detail="Error retrieving video from FTP server")
+
+
+@app.get("/stream_mobile_video/{video_path}")
+async def stream_video(request: Request, video_path: str):
+    remote_file_path = f"/videos/{video_path}.mp4"
+    local_file_path = os.path.join("app", "core", "video", video_path)
+    await download_file_from_ftp(remote_file_path, local_file_path)
+
+    async def iterfile():
+        with open(local_file_path, mode="rb") as file:
+            while chunk := file.read(1024 * 1024):  # 1MB 청크
+                yield chunk
+
+    return StreamingResponse(iterfile(), media_type="video/mp4")
 
 
 @app.get("/get_all_ranking/")
@@ -901,7 +937,37 @@ async def get_count_data(db: Session = Depends(get_db)):
     }
 
 
-if __name__ == "__main__":
-    import uvicorn
+@app.get("/enroll_quizzes/", response_model=List[schemas.Quiz])
+async def read_quizzes(db: Session = Depends(get_db)):
+    quizzes = crud.get_random_quizzes(db)
+    if not quizzes:
+        raise HTTPException(status_code=404, detail="Quizzes not found")
+    encoded_quizzes = []
+    for quiz in quizzes:
+        quiz_dict = quiz.__dict__  # Quiz 객체를 dict로 변환
+        encoded_quiz = {key: value.encode('utf-8') if isinstance(value, str) else value for key, value in
+                        quiz_dict.items()}
+        encoded_quizzes.append(encoded_quiz)
 
+    return encoded_quizzes
+
+
+@app.post("/submit-answers/")
+async def submit_answers(user_answers: schemas.UserAnswers, db: Session = Depends(get_db)):
+    correct_answers = crud.get_correct_answers(db, [answer.enrollment_quiz_id for answer in user_answers.answers])
+    score = sum(1 for answer in user_answers.answers if correct_answers[answer.enrollment_quiz_id] == answer.answer)
+
+    if score <= 2:
+        return "1"
+    elif score <= 4:
+        return "2"
+    elif score <= 6:
+        return "3"
+    elif score <= 8:
+        return "4"
+    else:
+        return "5"
+
+
+if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=30001)

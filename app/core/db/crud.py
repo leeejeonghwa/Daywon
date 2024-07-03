@@ -1,11 +1,11 @@
 import random
-from typing import Any
+from typing import Any, List
 
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 from app.core.db import models, schemas
 from app.core.db.models import Scripts, Question, Shortform, Admin, History, Ranking, CaseScripts, Comment, Category, \
-    User
+    User, Profile_images
 from passlib.hash import bcrypt
 
 from app.core.db.schemas import CategoryCreate, CategoryUpdate
@@ -34,6 +34,10 @@ def create_user(db: Session, user_create: schemas.UserCreate):
 
 def get_user(db: Session, user_id: int):
     return db.query(models.User).filter(models.User.user_id == user_id).first()
+
+
+def get_user_for_password(db: Session, e_mail: str, name: str):
+    return db.query(User).filter(User.e_mail == e_mail, User.name == name).first()
 
 
 def get_user_by_email(db: Session, e_mail: str) -> object:
@@ -226,7 +230,7 @@ def get_cotegory_name_by_category_id(db: Session, category_id: int):
     return all_db.content
 
 
-def create_category(db: Session, category_in: CategoryCreate):
+def create_categories(db: Session, category_in: CategoryCreate):
     db_obj = Category(
         content=category_in.content,
         label=category_in.label,
@@ -379,6 +383,10 @@ def get_admin_count(db: Session):
     return db.query(models.Admin).count()
 
 
+def get_admins_mobile(db: Session):
+    return db.query(models.Admin).filter(models.Admin.qualification_level != 3).all()
+
+
 # 가장 최근에 추가된 shortform 데이터를 읽어오는 함수
 def get_latest_shortform(db):
     return db.query(Shortform).order_by(desc(Shortform.form_id)).first()
@@ -452,14 +460,14 @@ def get_user_password(db: Session, admin_id: int):
 
 
 def create_user_history(db: Session, user_id: int, script_id: int, T_F: bool):
-    user_history = History(user_id=user_id, script_id=script_id, T_F=T_F)
+    user_history = History(user_id=user_id, scripts_id=script_id, T_F=T_F)
     db.add(user_history)
     db.commit()
     db.refresh(user_history)
     return user_history
 
 
-def update_user_history(db: Session, user_id: int, script_id: int):
+async def update_user_history(db: Session, user_id: int, script_id: int):
     user_history = db.query(History).filter(History.user_id == user_id, History.script_id == script_id).first()
     if user_history:
         user_history.time += 1
@@ -534,7 +542,7 @@ def get_created_problem_count(db: Session):
     return count
 
 
-# 검토 완료된 문제 개수
+# 검토 완료된 문제 개수4
 def get_true_questions_count(db: Session):
     count = db.query(func.count(Scripts.scripts_id)).filter(Scripts.inspection_status == True).scalar()
     return count
@@ -590,6 +598,7 @@ def get_shortforms_by_scripts_id(db: Session, scripts_id: int):
 def get_questions_by_scripts_id(db: Session, scripts_id: int):
     return db.query(Question).filter(Question.scripts_id == scripts_id).all()
 
+
 def get_comments_by_q_id(db: Session, q_id: int):
     return db.query(Comment).filter(Comment.q_id == q_id).all()
 
@@ -608,3 +617,20 @@ def get_case_scripts(db: Session):
 
 def get_shortform(db: Session):
     return db.query(Shortform).all()
+
+
+def get_profile_image_url(user_id: int, db: Session) -> str:
+    result = db.query(Profile_images.image_url). \
+        join(User, User.profile_image == Profile_images.image_id). \
+        filter(User.user_id == user_id).first()
+    return result.image_url if result else None
+
+
+def get_random_quizzes(db: Session, limit: int = 10):
+    quizzes = db.query(models.Enrollment_quiz).all()
+    return random.sample(quizzes, limit)
+
+
+def get_correct_answers(db: Session, quiz_ids: List[int]):
+    quizzes = db.query(models.Enrollment_quiz).filter(models.Enrollment_quiz.enrollment_quiz_id.in_(quiz_ids)).all()
+    return {quiz.enrollment_quiz_id: quiz.correct for quiz in quizzes}
